@@ -1,0 +1,216 @@
+#!/bin/bash
+#Licensed under the GNU GPLv2.
+
+APPNAME="Lite Update"
+LOGFILE=/var/log/lite-update.log
+
+function log(){
+    message="$@"
+    echo '['$(date +%D\ %H:%M:%S)'] '$message >>$LOGFILE
+}
+
+function checklock () {
+
+if [ -f /tmp/fifo ]; then
+	rm /tmp/fifo
+fi
+
+# Make a named pipe
+mkfifo /tmp/fifo
+
+# Check for exclusive lock and wait until package managers are closed
+# This executes in a subshell
+(
+# Wait until package managers finish performing tasks
+i=0
+
+while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ; do
+	echo "# Waiting for other software managers to finish..." $"\n"
+ if [ "$(pidof synaptic)" ] 
+then
+	echo "# Waiting for other software managers to finish..." $"\nsynaptic"
+fi
+echo 1
+    sleep 1
+echo 30
+    sleep 1
+echo 60
+    sleep 1
+if [ ! -z "$(pgrep gdebi-gtk)" ]
+then
+	echo "# Waiting for other software managers to finish..." $"\ngdebi-gtk"
+fi
+echo 95
+    sleep 2
+   ((i=i+1))
+done >> /tmp/fifo
+) &
+#Set subshell pid
+CLAMPID=$!
+
+# Import data from a named pipe into zenity progress and kill lite-update if the progress bar is closed by the user
+(`zenity --progress --title="$APPNAME - close any open package managers" --text=" Waiting for other software managers to finish..." --percentage=20 --auto-close </tmp/fifo` || killall -9 lite-update >/dev/null) &
+
+# Sets the zenity subshell pid
+ZENPID=$!
+
+# Wait until zenity subshell finishes
+wait $ZENPID
+
+# If the subshell with CLAMPID exists kill it
+if [[ -e /proc/$CLAMPID ]]; then
+	kill $CLAMPID
+fi
+
+# Removes named pipe
+rm /tmp/fifo
+}
+
+
+function showlog () {
+	if [[ ! -f $LOGFILE ]]; then
+		zenity --info --title="$APPNAME Info" --text="No log file."
+	elif  [[  -z "$(cat $LOGFILE)"  ]]; then
+		zenity --info --title="$APPNAME Info" --text="Log is empty."
+	else
+		zenity --text-info --cancel-label="Close" --ok-label="Open log in a text editor."  --title="$APPNAME log file -> $log" --height=600 --width=800 --filename="$LOGFILE"
+		if [ "${PIPESTATUS[0]}" -eq "0" ]; then
+			exo-open "$LOGFILE"
+		fi
+	fi
+	main
+}
+
+function about () {
+	zenity --info --title="$APPNAME About..." --height=300 --width=400 --text="$APPNAME is a small GUI based on zenity for Linux Lite, desinged for Linux Lite and very easy to use.\n\nLicence GPL v2."
+	main
+}
+
+function help () {
+	zenity --text-info --title="$APPNAME Help" --height=600 --width=800 --html --filename="/usr/share/doc/litemanual/index.html"
+	main
+}
+
+function update() {
+
+# Temporary file for error tracking 
+TMPLIST=$(mktemp /tmp/repos.XXXXXX)
+
+  APTUPDATE=$(grep '^deb' -c /etc/apt/sources.list) # Total of repositories registered, this is approximated
+
+    sudo apt-get update 2>&1 | tee $TMPLIST |awk -v total=$APTUPDATE '/^Ign|^ Get/{count++;$1=""} FNR { if (total != 0){percentage=int (100*count/total);print (percentage < 90?percentage:90),"\n#",substr($0, 0, 128) }; fflush(stdout)}' \
+      | zenity --progress --text="Updating package lists..." --window-icon=$ic --title="Updating Software Sources - please wait..." --percentage=0 --auto-close --width=600
+
+                                if [ "${PIPESTATUS[0]}" -ne "0" ]; then
+					err_msg=$(awk '/^(W:|E:)/{$1=""; print $0}' $TMPLIST | tail -n 1 )	#Get errors/warnings
+					log "ERROR: $err_msg"
+                                        unset APTUPDATE
+					rm -f $TMPLIST
+					unset TMPLIST
+                                        zenity --error \
+                                        --title="Error" --text="$APPNAME couldn't fetch the package cache information lists."
+
+                                       main
+                                fi
+    log "INFO: Software sources were updated."
+
+unset APTUPDATE
+rm -f $TMPLIST
+unset TMPLIST
+
+#  Temporary list of available updates
+UPDATES=$(mktemp /tmp/updateslist.XXXXXX)
+
+# Creates a list in /tmp/updateslist
+apt-get --just-print upgrade 2>&1 | perl -ne 'if (/Inst\s([\w,\-,\d,\.,~,:,\+]+)\s\[([\w,\-,\d,\.,~,:,\+]+)\]\s\(([\w,\-,\d,\.,~,:,\+]+)\)? /i) {print "Name: $1 INSTALLED: $2 AVAILABLE: $3\n"}' | awk '{print NR,":\t"$0}' | tee $UPDATES >/dev/null
+
+# Check if any updates are available, if there are none, script pops up dialog box saying 'No Updates Available', removes /tmp/updateslist.XXXXXX
+if [  -z "$(cat $UPDATES)"  ]; then
+    log "INFO: No updates are available."
+   rm -f $UPDATES
+   unset UPDATES
+    zenity --info --window-icon="/usr/share/icons/zenity-llcc.png" --title="$APPNAME" \
+      --text="No Updates Available"
+
+   main
+fi
+	# Log available updates
+    lst_upgrades=$(awk '/Name:/{print $4"\n"}' $UPDATES)
+    log "INFO: Updates available: $lst_upgrades"
+
+# Insert text into  /tmp/updateslist.XXXXXX
+sed -i -e '1 i\List of available Updates' -e '1 i\Click Update to continue or Cancel to stop the update process\n'  $UPDATES
+
+# Erase existing available info
+sudo dpkg --clear-avail
+
+
+
+# Call the zenity dialog to show update list
+zenity --text-info --ok-label="Update" --cancel-label="Cancel" --title="$APPNAME" --width=780 --height=300 --filename="$UPDATES"
+      if [ "$?" -eq "0" ];then
+
+      # Continue script if no halt
+
+	# Write log
+    lst_upgrades=$(awk '/Name:/{print $4}' $UPDATES)
+    log "INFO: Updating: $lst_upgrades"
+
+                 # Remove tmp file and unset variable
+                 rm -f $UPDATES
+                 unset UPDATES
+
+	# Begin upgrade
+	sudo DEBIAN_FRONTEND=noninteractive apt-get  -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade -y  2>&1 | tee /var/log/llupdates.log | awk ' BEGIN { FS=" "; total=1;end_download=0} /upgraded/ {total= $1 + $3;FS="[ :]" } /^Get:[[:digit:]]+/ {printf "#Downloading %s %s %s\n",$6,$(NF-1),$NF;print int(($2 - 1) * 100 / total); fflush(stdout)} /^\(Reading / {if (end_download==0){print 100;fflush(stdout);end_download=1}} /^(Preparing|Unpacking|Selecting|Processing|Setting|Download)/ {print "#", substr($0, 0, 128); fflush(stdout)}' \
+	 | ( zenity --progress --width=600 --text="Downloading package(s)...\nThis may take a while." --title="Downloading - please wait..." --percentage=0 --auto-close ; zenity --progress --width=600 --text="Installing and configuring packages...\nThis may take a while." --title="Installing - please wait..."  --pulsate --auto-close )
+
+                                if [ "${PIPESTATUS[0]}" -ne "0" ]; then
+					err_msg=$(awk '/^(W:|E:)/{$1=""; print $0}' /var/log/llupdates.log | tail -n 1)
+					log "ERROR:$err_msg"
+                                        zenity --error \
+                                        --title="Error" --text="Updates have failed."
+                                        main
+                                fi
+
+      # Halt updates script if user selects Cancel
+       else
+       log "INFO: User has canceled software upgrades."
+         rm -f $UPDATES
+        unset UPDATES
+	 zenity --error --title="$APPNAME"  --text="Updates Cancelled."
+         main
+    fi
+
+    log "INFO: Updates successfully installed."
+
+PROCEED=$(zenity --question --title="$APPNAME" --text="Updates have finished installing.\n\nWould you like to view the $APPNAME log?"; echo $?)
+if [ ${PROCEED} -eq 1 ]; then
+   zenity --info --title="$APPNAME" --text="Updates Complete."
+   main;
+else
+   zenity --text-info --ok-label="Quit" --cancel-label="Cancel" --title="Updates Log" --width=700 --height=300 --filename="/var/log/llupdates.log"
+fi
+
+	main
+}
+
+function main () {
+
+	selection=$(zenity --list --radiolist --title="$APPNAME" --text="Pick a task" --height=310 --width=350 --hide-column=2 --cancel-label=Exit --ok-label=Select --column="Pick" --column="Function" --column="Task" \
+				"TRUE" "update" "Update Packages" "FALSE" "showlog" "Show log" "FALSE" "help" "Help" "FALSE" "about" "About this application" "FALSE" "exit" "Exit" ) || exit
+
+case "$selection" in
+	update) checklock && update
+;;
+	showlog) showlog
+;;
+	help) help
+;;
+	about) about
+;;
+	exit) exit 0
+;;
+esac
+}
+
+main
